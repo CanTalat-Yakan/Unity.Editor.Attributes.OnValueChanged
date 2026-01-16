@@ -51,7 +51,10 @@ namespace UnityEssentials
             InspectorHook.GetAllProperties(out var allProperties);
             foreach (var property in allProperties)
             {
-                var target = InspectorHookUtilities.GetTargetObjectOfProperty(property);
+                var target = InspectorHookUtilities.GetTargetObjectOfProperty(property) as Object;
+                if (!target) // can happen during selection churn / inspector rebuild
+                    continue;
+
                 if (!propertiesByTarget.TryGetValue(target, out var list))
                     propertiesByTarget[target] = list = new List<SerializedProperty>();
                 list.Add(property);
@@ -60,6 +63,7 @@ namespace UnityEssentials
             foreach (var kvp in propertiesByTarget)
             {
                 var target = kvp.Key;
+
                 var properties = kvp.Value;
 
                 InspectorHook.GetAllMethods(target.GetType(), out var allMethods);
@@ -89,29 +93,47 @@ namespace UnityEssentials
 
         public static void OnPostProcess()
         {
-            if (!s_monitoredPropertiesDictionary.TryGetValue(InspectorHook.Target, out var snapshots) ||
-                !s_monitoredMethodsDictionary.TryGetValue(InspectorHook.Target, out var methods))
+            var hookTarget = InspectorHook.Target;
+            if (!hookTarget)
+                return;
+
+            if (!s_monitoredPropertiesDictionary.TryGetValue(hookTarget, out var snapshots) ||
+                !s_monitoredMethodsDictionary.TryGetValue(hookTarget, out var methods))
                 return;
 
             foreach (var snapshot in snapshots)
+            {
+                // Properties can go stale when the inspector redraws, targets are destroyed, undo/redo, etc.
+                if (snapshot?.Property == null)
+                    continue;
+
+                var snapshotTarget = snapshot.Property.serializedObject?.targetObject as Object;
+                if (!snapshotTarget)
+                    continue;
+
                 foreach (var method in methods)
                 {
                     InspectorHookUtilities.TryGetAttribute<OnValueChangedAttribute>(method, out var attribute);
                     if (!attribute.ReferenceNames.Contains(snapshot.Name))
                         continue;
 
-                    if (!Equals(snapshot.Value, InspectorHookUtilities.GetPropertyValue(snapshot.Property)))
+                    var currentValue = InspectorHookUtilities.GetPropertyValue(snapshot.Property);
+                    if (!Equals(snapshot.Value, currentValue))
                     {
-                        snapshot.Value = InspectorHookUtilities.GetPropertyValue(snapshot.Property);
+                        snapshot.Value = currentValue;
 
-                        var target = method.IsStatic ? null : InspectorHookUtilities.GetTargetObjectOfProperty(snapshot.Property);
+                        var invokeTarget = method.IsStatic ? null : InspectorHookUtilities.GetTargetObjectOfProperty(snapshot.Property);
+                        if (!method.IsStatic && invokeTarget is Object unityObj && !unityObj)
+                            continue;
+
                         var parameters = method.GetParameters();
                         if (parameters.Length == 0)
-                            method.Invoke(target, null);
+                            method.Invoke(invokeTarget, null);
                         else if (parameters.Length == 1 && parameters[0].ParameterType == typeof(string))
-                            method.Invoke(target, new object[] { snapshot.Name });
+                            method.Invoke(invokeTarget, new object[] { snapshot.Name });
                     }
                 }
+            }
         }
     }
 }
